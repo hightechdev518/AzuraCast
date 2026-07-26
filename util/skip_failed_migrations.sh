@@ -87,18 +87,48 @@ parse_failed_version() {
     || true
 }
 
-# Parse "New Migrations: N" (Doctrine status summary line) from status output.
-parse_new_count() {
-  local out="$1"
-  local line count
+# Strip ANSI color codes from command output before parsing.
+strip_ansi() {
+  # shellcheck disable=SC2001
+  echo "$1" | sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g'
+}
 
-  line="$(echo "$out" | grep -iE 'New[[:space:]]+Migrations' | head -n1 || true)"
+# Parse the New count from Doctrine Migrations 3.x `migrations:status` table.
+#
+# Real format (rowspan group "Migrations") looks like:
+#   | Migrations | Executed             | 250 |
+#   |            | Executed Unavailable | 0   |
+#   |            | Available            | 280 |
+#   |            | New                  |  5  |
+#
+# When New > 0 the value cell is padded with spaces (e.g. " 5 "). The label
+# is the single word "New" — NOT "New Migrations".
+parse_new_count() {
+  local out cleaned line count
+
+  cleaned="$(strip_ansi "$1")"
+
+  # Prefer an exact table-cell match for the label "New".
+  # Matches both ASCII pipes and common box-drawing verticals.
+  line="$(
+    echo "$cleaned" \
+      | grep -E '(^|[|+│])[[:space:]]*New[[:space:]]*([|+│]|$)' \
+      | grep -viE 'New[[:space:]]+Migrations|Namespace' \
+      | head -n1 \
+      || true
+  )"
+
+  # Fallback: older Doctrine text style "New Migrations: 5"
+  if [[ -z "$line" ]]; then
+    line="$(echo "$cleaned" | grep -iE 'New[[:space:]]+Migrations' | head -n1 || true)"
+  fi
+
   if [[ -z "$line" ]]; then
     echo ""
     return 1
   fi
 
-  # Last integer on the line (handles padded Doctrine table formatting).
+  # Value is the last integer on that row (handles "  12  " padding).
   count="$(echo "$line" | grep -Eo '[0-9]+' | tail -n1 || true)"
   if [[ -z "$count" ]]; then
     echo ""
@@ -122,12 +152,13 @@ check_new_count() {
   # Status can be non-zero in some edge cases; still try to parse New count.
   NEW_COUNT="$(parse_new_count "$status_out" || true)"
   if [[ -z "${NEW_COUNT}" ]]; then
-    echo "ERROR: could not parse 'New Migrations' count from migrations:status output." >&2
+    echo "ERROR: could not parse 'New' count from migrations:status table output." >&2
+    echo "Expected a table row like: | New | 5 |" >&2
     echo "Raw status output was printed above for manual review." >&2
     exit 3
   fi
 
-  echo "==> New Migrations count: ${NEW_COUNT}"
+  echo "==> Parsed New count: ${NEW_COUNT}"
   echo
 
   return 0
@@ -166,11 +197,11 @@ while (( attempt < MAX_ATTEMPTS )); do
 
   echo "==> Still ${NEW_COUNT} new migration(s) pending — migrate exit was ${migrate_rc}."
 
-  # Pending work remains. Only skip-mark when migrate actually failed with a
-  # known idempotent error; otherwise retry (or abort on unexpected failure).
+  # Pending work remains. If migrate exited 0, do NOT stop — loop and retry.
+  # Only skip-mark when migrate actually failed with a known idempotent error.
   if (( migrate_rc == 0 )); then
-    echo "WARNING: migrate exited 0 but New Migrations is still ${NEW_COUNT}."
-    echo "         Not skipping anything; will retry migrate on next attempt."
+    echo "WARNING: migrate exited 0 but New count is still ${NEW_COUNT}."
+    echo "         Looping to retry migrate automatically (attempt will increment)."
     echo
     continue
   fi
@@ -210,11 +241,11 @@ while (( attempt < MAX_ATTEMPTS )); do
     exit 1
   fi
 
-  echo "--> Marked ${fqcn} applied; checking status, then retrying migrate…"
+  echo "--> Marked ${fqcn} applied; re-checking New count, then looping to retry migrate…"
   check_new_count
   if [[ "${NEW_COUNT}" == "0" ]]; then
     echo
-    echo "SUCCESS: migrations:status reports New Migrations = 0 after marking ${version}."
+    echo "SUCCESS: migrations:status reports New = 0 after marking ${version}."
     if [[ -s "$SKIP_LOG" ]]; then
       echo "Skipped versions were logged to: $SKIP_LOG"
       echo "---- skipped versions ----"
@@ -223,6 +254,9 @@ while (( attempt < MAX_ATTEMPTS )); do
     fi
     exit 0
   fi
+
+  echo "==> New is still ${NEW_COUNT} after skip-mark; continuing loop to run migrate again."
+  echo
 done
 
 echo
