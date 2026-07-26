@@ -7,11 +7,14 @@
 #   2. For each DDL target (table / column / index / constraint), query
 #      information_schema (via SHOW TABLES / SHOW COLUMNS / SHOW INDEX /
 #      TABLE_CONSTRAINTS) to see whether the desired end-state already holds
-#   3. If EVERY checkable target is already satisfied →
+#   3. If EVERY checkable DDL target is already satisfied →
 #        migrations:version FQCN --add -n   (SKIPPED-already-present)
-#      NEVER runs the migration SQL in this case
-#   4. If anything is still missing / unknown / non-DDL →
-#        migrations:execute FQCN --up -n    (EXECUTED)
+#      NEVER runs the migration SQL in this case.
+#      Blanket data statements (UPDATE/INSERT with no WHERE — typical
+#      default-value backfills) do NOT force EXECUTE when schema is satisfied.
+#   4. If any DDL target is still missing, OR a data statement looks
+#      targeted/conditional (WHERE / DELETE / TRUNCATE / etc.), OR SQL is
+#      genuinely unparseable → migrations:execute FQCN --up -n (EXECUTED)
 #
 # No error-message parsing. Decisions are based only on schema probes.
 #
@@ -320,8 +323,18 @@ extract_up_sql() {
 #   NEED|<kind>|<table>|<name>|<human>
 #   OK_IF_PRESENT|<kind>|<table>|<name>|<human>   (ADD/CREATE: skip if present)
 #   OK_IF_ABSENT|<kind>|<table>|<name>|<human>    (DROP: skip if absent)
+#   BLANKET_DML|<human>   (UPDATE/INSERT with no WHERE — ignorable if schema OK)
+#   TARGETED_DML|<human>  (conditional/specific data — forces EXECUTE)
 #   UNKNOWN|<reason>
 # ---------------------------------------------------------------------------
+
+# True if SQL contains a top-level WHERE (ignores WHERE inside simple string
+# literals as best-effort; good enough for migration SQL).
+sql_has_where() {
+  local upper
+  upper="$(echo "$1" | tr '[:lower:]' '[:upper:]')"
+  echo "$upper" | grep -Eq '[[:space:]]WHERE[[:space:]]'
+}
 
 classify_sql() {
   local sql="$1"
@@ -513,9 +526,36 @@ classify_sql() {
     return 0
   fi
 
-  # ---- DML / other ----
-  if [[ "$upper" =~ ^(INSERT|UPDATE|DELETE|REPLACE|TRUNCATE|SET|CALL|CREATE[[:space:]]+(VIEW|TRIGGER|PROCEDURE|FUNCTION|EVENT)|DROP[[:space:]]+(VIEW|TRIGGER|PROCEDURE|FUNCTION|EVENT)|RENAME) ]]; then
-    echo "UNKNOWN|non-schema / data statement: ${sql:0:80}"
+  # ---- DML ----
+  # Blanket = whole-table default backfill (no WHERE). Targeted = conditional /
+  # row-specific or destructive data change → must actually run if schema is new,
+  # and also blocks SKIP even when schema is already satisfied.
+  if [[ "$upper" =~ ^UPDATE[[:space:]] ]]; then
+    if sql_has_where "$sql"; then
+      echo "TARGETED_DML|UPDATE with WHERE (conditional data): ${sql:0:100}"
+    else
+      echo "BLANKET_DML|UPDATE with no WHERE (blanket default backfill): ${sql:0:100}"
+    fi
+    return 0
+  fi
+
+  if [[ "$upper" =~ ^INSERT[[:space:]] ]]; then
+    if sql_has_where "$sql"; then
+      echo "TARGETED_DML|INSERT with WHERE (conditional data): ${sql:0:100}"
+    else
+      echo "BLANKET_DML|INSERT with no WHERE (blanket/seed data): ${sql:0:100}"
+    fi
+    return 0
+  fi
+
+  if [[ "$upper" =~ ^(DELETE|REPLACE|TRUNCATE)[[:space:]] ]]; then
+    echo "TARGETED_DML|destructive/targeted data statement: ${sql:0:100}"
+    return 0
+  fi
+
+  # ---- other non-schema ----
+  if [[ "$upper" =~ ^(SET|CALL|CREATE[[:space:]]+(VIEW|TRIGGER|PROCEDURE|FUNCTION|EVENT)|DROP[[:space:]]+(VIEW|TRIGGER|PROCEDURE|FUNCTION|EVENT)|RENAME) ]]; then
+    echo "UNKNOWN|non-schema statement: ${sql:0:80}"
     return 0
   fi
 
@@ -525,6 +565,8 @@ classify_sql() {
 # Probe one classified check line. Prints:
 #   SATISFIED|<human>|<detail>
 #   NEEDED|<human>|<detail>
+#   BLANKET|<human>
+#   TARGETED|<human>
 #   UNKNOWN|<human>
 probe_check() {
   local line="$1"
@@ -533,6 +575,15 @@ probe_check() {
   case "$mode" in
     UNKNOWN)
       echo "UNKNOWN|${kind}"
+      return 0
+      ;;
+    BLANKET_DML)
+      # kind holds the human reason for these one-field modes
+      echo "BLANKET|${kind}"
+      return 0
+      ;;
+    TARGETED_DML)
+      echo "TARGETED|${kind}"
       return 0
       ;;
     OK_IF_PRESENT)
@@ -612,20 +663,24 @@ probe_check() {
 }
 
 # Decide SKIP vs EXECUTE for one migration file.
-# Sets globals: DECISION (SKIP|EXECUTE), DECISION_REASON
+# Sets globals: DECISION (SKIP|EXECUTE), DECISION_REASON, DECISION_TAG
 analyze_migration() {
   local file="$1"
   local sql checks_out probe_out
   local -a sqls=()
   local -a reasons_sat=()
   local -a reasons_need=()
+  local -a reasons_blanket=()
+  local -a reasons_targeted=()
   local -a reasons_unk=()
 
   DECISION="EXECUTE"
   DECISION_REASON=""
+  DECISION_TAG="EXECUTED"
 
   if [[ ! -f "$file" ]]; then
     DECISION="EXECUTE"
+    DECISION_TAG="EXECUTED-no-file"
     DECISION_REASON="migration file not found; cannot preflight → execute"
     return 0
   fi
@@ -634,6 +689,7 @@ analyze_migration() {
 
   if (( ${#sqls[@]} == 0 )); then
     DECISION="EXECUTE"
+    DECISION_TAG="EXECUTED-unparseable"
     DECISION_REASON="no parseable addSql() literals in up(); cannot preflight → execute"
     return 0
   fi
@@ -657,9 +713,17 @@ analyze_migration() {
           reasons_need+=("${detail:-$human}")
           echo "      [schema] NEEDED    — ${detail:-$human}"
           ;;
+        BLANKET)
+          reasons_blanket+=("${human}")
+          echo "      [data]   BLANKET   — ${human}"
+          ;;
+        TARGETED)
+          reasons_targeted+=("${human}")
+          echo "      [data]   TARGETED  — ${human}"
+          ;;
         *)
           reasons_unk+=("${human}")
-          echo "      [schema] UNKNOWN   — ${human}"
+          echo "      [other]  UNKNOWN   — ${human}"
           ;;
       esac
     done < <(probe_check "$checks_out")
@@ -669,26 +733,51 @@ analyze_migration() {
     done
   )
 
+  # 1) Genuine new schema work still required.
   if (( ${#reasons_need[@]} > 0 )); then
     DECISION="EXECUTE"
-    DECISION_REASON="still needed: $(IFS='; '; echo "${reasons_need[*]}")"
+    DECISION_TAG="EXECUTED-schema-needed"
+    DECISION_REASON="schema target not satisfied: $(IFS='; '; echo "${reasons_need[*]}")"
     return 0
   fi
 
+  # 2) Conditional / destructive data — must run for real (never skip-mark).
+  if (( ${#reasons_targeted[@]} > 0 )); then
+    DECISION="EXECUTE"
+    DECISION_TAG="EXECUTED-targeted-data"
+    DECISION_REASON="targeted/conditional data statement present: $(IFS='; '; echo "${reasons_targeted[*]}")"
+    return 0
+  fi
+
+  # 3) Genuinely unparseable / non-classifiable SQL.
   if (( ${#reasons_unk[@]} > 0 )); then
     DECISION="EXECUTE"
+    DECISION_TAG="EXECUTED-uncheckable"
     DECISION_REASON="uncheckable SQL present: $(IFS='; '; echo "${reasons_unk[*]}")"
     return 0
   fi
 
+  # 4) No schema checks at all (data-only or empty classification) → execute.
   if (( ${#reasons_sat[@]} == 0 )); then
     DECISION="EXECUTE"
-    DECISION_REASON="no schema checks produced; execute for safety"
+    DECISION_TAG="EXECUTED-no-schema-checks"
+    if (( ${#reasons_blanket[@]} > 0 )); then
+      DECISION_REASON="no schema DDL to verify; blanket data alone is not enough to skip: $(IFS='; '; echo "${reasons_blanket[*]}")"
+    else
+      DECISION_REASON="no schema checks produced; execute for safety"
+    fi
     return 0
   fi
 
+  # 5) All schema targets satisfied. Blanket DML (if any) is ignored for skip.
   DECISION="SKIP"
-  DECISION_REASON="all targets already at desired state: $(IFS='; '; echo "${reasons_sat[*]}")"
+  if (( ${#reasons_blanket[@]} > 0 )); then
+    DECISION_TAG="SKIPPED-already-present+ignored-blanket-dml"
+    DECISION_REASON="all schema targets already satisfied ($(IFS='; '; echo "${reasons_sat[*]}")); ignoring blanket data backfill(s): $(IFS='; '; echo "${reasons_blanket[*]}")"
+  else
+    DECISION_TAG="SKIPPED-already-present"
+    DECISION_REASON="all schema targets already at desired state: $(IFS='; '; echo "${reasons_sat[*]}")"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -753,11 +842,11 @@ for fqcn in "${PENDING[@]}"; do
   analyze_migration "$file"
 
   echo
-  echo "--> Decision: ${DECISION}"
+  echo "--> Decision: ${DECISION} (${DECISION_TAG})"
   echo "--> Reason:   ${DECISION_REASON}"
 
   if [[ "$DECISION" == "SKIP" ]]; then
-    log_decision "$fqcn" "SKIPPED-already-present" "$DECISION_REASON"
+    log_decision "$fqcn" "$DECISION_TAG" "$DECISION_REASON"
 
     mark_out=""
     mark_rc=0
@@ -771,12 +860,12 @@ for fqcn in "${PENDING[@]}"; do
       exit 1
     fi
 
-    log_outcome "SKIPPED-already-present" "$fqcn" "$DECISION_REASON"
+    log_outcome "$DECISION_TAG" "$fqcn" "$DECISION_REASON"
     skipped=$((skipped + 1))
     continue
   fi
 
-  log_decision "$fqcn" "EXECUTED" "$DECISION_REASON"
+  log_decision "$fqcn" "$DECISION_TAG" "$DECISION_REASON"
 
   exec_out=""
   exec_rc=0
@@ -788,12 +877,12 @@ for fqcn in "${PENDING[@]}"; do
   if (( exec_rc != 0 )); then
     echo
     echo "ERROR: migrations:execute failed for ${fqcn}."
-    echo "Preflight decided EXECUTE because: ${DECISION_REASON}"
+    echo "Preflight decided ${DECISION_TAG} because: ${DECISION_REASON}"
     echo "Full execute output was printed above. Not marking as applied."
     exit 1
   fi
 
-  log_outcome "EXECUTED" "$fqcn" "$DECISION_REASON"
+  log_outcome "$DECISION_TAG" "$fqcn" "$DECISION_REASON"
   executed=$((executed + 1))
 done
 
