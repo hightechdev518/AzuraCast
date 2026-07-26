@@ -6,7 +6,8 @@
 # For each pending version:
 #   1. azuracast_cli migrations:execute 'App\Entity\Migration\Version…' --up -n
 #   2. On success → log EXECUTED
-#   3. On 'already exists' / 'doesn't exist' → migrations:version … --add -n, log SKIPPED
+#   3. On 'already exists' / 'doesn't exist' / 'can't drop…check that it exists'
+#      → migrations:version … --add -n, log SKIPPED
 #   4. On any other failure → stop and print the full error
 #
 # Run INSIDE the AzuraCast web container, e.g.:
@@ -79,7 +80,10 @@ strip_ansi() {
 
 is_skippable_error() {
   local out="$1"
-  echo "$out" | grep -Eiq "already exists|doesn't exist|does not exist"
+  # Idempotent schema-drift failures: object already present, or drop/alter of
+  # something that is already gone (incl. MySQL 1091 "Can't DROP … check that it exists").
+  echo "$out" | grep -Eiq \
+    "already exists|doesn't exist|does not exist|check that it exists|can'?t drop"
 }
 
 log_outcome() {
@@ -240,7 +244,7 @@ for fqcn in "${PENDING[@]}"; do
       exit 1
     fi
 
-    log_outcome "SKIPPED" "$fqcn" "already exists / doesn't exist"
+    log_outcome "SKIPPED" "$fqcn" "idempotent schema drift"
     skipped=$((skipped + 1))
     continue
   fi
