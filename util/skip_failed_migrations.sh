@@ -47,9 +47,20 @@ echo
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Run a command with argv printed, stream stdout+stderr live, and capture the
+# full combined output into the nameref variable. Returns the command's exit code.
+#
+# Uses a real temp file (not var="$(cmd | tee)"), so:
+#   - live output still appears on the terminal
+#   - is_skippable_error always sees the full error text
+#   - PIPESTATUS[0] is read in the same shell as the pipeline
 run_visible() {
   local -n _capture="$1"
   shift
+
+  local tmp rc
+  tmp="$(mktemp)"
+  rc=0
 
   echo
   echo "------------------------------------------------------------------------"
@@ -57,13 +68,14 @@ run_visible() {
   echo "------------------------------------------------------------------------"
 
   set +e
-  local tee_target=/dev/stderr
-  if [[ -w /dev/tty ]]; then
-    tee_target=/dev/tty
-  fi
-  _capture="$("$@" 2>&1 | tee "$tee_target")"
-  local rc=${PIPESTATUS[0]}
+  # Same-shell pipeline: cmd → tee → stdout (live) + temp file (capture).
+  # PIPESTATUS[0] is the CLI exit code in THIS shell (not inside $()).
+  "$@" 2>&1 | tee "$tmp"
+  rc=${PIPESTATUS[0]}
   set -e
+
+  _capture="$(cat "$tmp" 2>/dev/null || true)"
+  rm -f "$tmp"
 
   echo "------------------------------------------------------------------------"
   echo "+ exit code: ${rc}"
